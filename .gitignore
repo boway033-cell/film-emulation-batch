@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行产物
+out/
+preview/
+verify_out/
+film_*/
+*.cube
+
+# 系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 校验脚本的临时文件
+scripts/verify/_tmp/
