@@ -1,7 +1,6 @@
 ---
 name: film-emulation-batch
-description: 本地批量胶片感调色（胶片模拟）。用 Pillow+numpy 实现每通道曲线 LUT、色相带选择性调整（绿→青绿）、独立通道色偏(crossover)、暗部硬度、高斯颗粒、高光溢出(halation)、暗角、acutance，支持外部 .cube 3D LUT。含富士（Superia / 經典 Neg / C200 / Pro 400H / Velvia 50 / Provia 100F / Classic Chrome / Eterna / ACROS）与柯达（Portra / Gold / Ektar / Kodachrome / Cinestill / Tri-X）两族预设。调色前会先判断源色彩格式：RAW 自动显影、相机灰片（S-Log3/S-Log2/V-Log/LogC3/LogC4/Apple Log）自动反 log 恢复原本色彩、普通成片与手机照片原样通过（手机拍的 Log 也会识别还原）。当用户说"胶片感""胶片模拟""富士色调""青绿色""Portra 风格""加颗粒""光晕""把一批照片调成胶片""处理 RAW""灰片还原""log 还原"时使用。纯本地离线、无 API 费用。
-agent_created: true
+description: 本地离线照片调色与参考图色彩复刻。先判定并还原 RAW、Log 或普通成片，再对原片色彩与光影作风格化再创作，最后执行富士、柯达及江南园林电影色的胶卷处理。当用户要求明显的胶片质感、富士或柯达色调、胶卷前的色彩光影再创作、批量调色、RAW/Log 还原，或按古风园林剧照复刻冷青绿与烛光琥珀时使用。
 ---
 
 # 批量胶片感模拟（film-emulation-batch）
@@ -16,6 +15,27 @@ agent_created: true
 - 套用外部下载的 `.cube` 3D LUT
 - 需要**可复现**（固定随机种子 + 固定参数，两次跑出同一张图）
 - 输入是 **RAW 或相机灰片（Log）** ：默认会先自动判定并归一到正常色彩，再套预设
+- 依据参考图复刻**江南园林电影色**：低饱和冷青绿园林画面，或保留局部烛光的暖琥珀室内画面
+- 用户要求原片先做鲜明的**色彩与光影再创作**，再进入胶卷模拟；需要可选暖/冷/鲜艳/柔和方向及旧新版对照
+
+## 参考图复刻的触发与调用
+
+- **自动触发**：用户明确要求“按这些参考图调色/复刻色调”，或描述“古风园林、江南园林、青绿灰紫、暗调电影感、烛光琥珀”等，并提供要处理的照片或可选片目录。仅说“青绿色”而没有这类画面线索时，先按普通胶片预设需求理解，不直接锁定此风格。
+- **显式触发**：用户点名 `$film-emulation-batch`，或指定 `jiangnan_cool` / `jiangnan_amber`。显式指定预设时照指定预设执行；只点名 skill 时按照片和目标判断。
+- **调用规则**：给定参考图与候选原片时，参考图只用于提取风格，不当作待处理原片。先看构图、光线和内容选片；园林、植物、木石、阴天窗景优先 `jiangnan_cool`，真实烛光或暖室内光源优先 `jiangnan_amber`。没有合适的暖光原片时不为凑数量硬套暖版。已调色成片、黑边拼图和视频截图不作为默认原片。
+- **交付**：输出可复现的预设与参数、逐张选片理由、每张原片和成片的并排对比；检查全图及 1:1 局部的肤色或中性色、亮部细节、暗部层次。色彩能复刻，参考图的演员、布景、光位与镜头虚化无法由调色生成。
+
+读 [docs/jiangnan-cinema-reference.md](docs/jiangnan-cinema-reference.md) 了解风格锚点、选片判断和微调顺序；执行前仍须遵守下文“先判源、再调色”。
+
+## 三阶段：还原 → 再创作 → 胶卷处理
+
+**调用规则**：触发本 skill 的任一胶卷或园林风格调色请求，默认依次执行以下三步。用户指定 `neutral` 时作为对照组，不加再创作；用户明确要旧版效果时用 `--style-strength 0`。参考图只决定风格方向，不当作待处理原片。
+
+1. **基础色彩还原**：先识别 RAW、Log/灰片或普通成片。RAW 只显影，可信的 Log 反曲线，普通成片直通。目标是给下一步一张曝光与色彩可用的 sRGB 图，不把灰片直接套胶卷预设。
+2. **原片色彩与光影再创作**：在已还原的照片上独立塑造冷暖、阴影和高光、局部反差及色度；输出仍为可继续处理的 sRGB 图。它负责确定作品的情绪和视觉重心，保持可辨的主体、纹理和亮部层次。`--creative-direction auto` 随预设选方向；也可显式选 `warm`（琥珀暖光）、`cool`（青蓝暗部）、`vivid`（浓艳反差）、`soft`（柔和粉彩）。`--style-strength 0..1` 同时控制再创作与胶卷风格强度，默认 1；`--save-creative` 导出此阶段中间图供逐阶段核对。
+3. **胶卷处理**：把再创作图作为输入，再执行胶卷曲线、色彩交叉、色相带、颗粒、光晕及暗角。目标是让色彩关系、光影与 1:1 颗粒共同形成一眼可辨的预设特征：Gold 的暖金、Velvia 的浓艳深影、Classic Chrome 的低饱和硬暗部、CineStill 的夜景冷暖与高光晕等；不能只靠全局饱和度或统一色罩。`neutral` 保留为轻微处理的对照。
+
+交付时至少展示同一原片的**原片 → 再创作中间图 → 最终胶卷成片**，再配旧版 `--style-strength 0` 对照；在全图看风格辨识度，在 1:1 裁切看颗粒、肤色与高光。不能凭参数宣称“真实胶卷扫描”或保证每张原片都适合所有预设。详见 [docs/creative-stage.md](docs/creative-stage.md)。
 
 ## 先判源、再调色（默认开启）
 
@@ -60,6 +80,8 @@ RAW / Log 直接喂进去等于在错误基准上再叠一次对比与饱和。
 中位亮度并叠加其色调形状，与相机直出观感一致）、`--raw-denoise {off,light,full}`、
 `--prep-exposure`、`--prep-knee`、`--prep-knee-k`、`--no-prep-report`、`--prep-json`、`--no-raw`。
 
+RAW 显影必须从 `rawpy` 取得 **16bit 线性输出**（`gamma=(1,1)`），才能在线性域做曝光锚定。`reference-tone` 的亮度映射对近白天空等高光场景可能过强；预览若出现色带、噪点或高光形状异常，改用 `--raw-anchor reference` 只对齐亮度，再复核后调色。
+
 > RAW 支持依赖 `rawpy`（LibRaw）。没装时 `rawpy` 缺省 → RAW 文件会被列为 `unsupported` 跳过，
 > 普通图片与灰片判定不受影响。`pip install rawpy` 即可。
 
@@ -101,6 +123,11 @@ S="scripts/film_emulate.py"
 # 全预设对比图（先让用户看效果再决定跑哪个）
 "$PY" "$S" --sheet "D:/photos/one.jpg" -o "D:/preview" --max-edge 1200
 
+# 默认显著版；另存再创作中间图，便于检查进入胶卷步骤前的色彩与光影
+"$PY" "$S" -i "D:/photos/one.jpg" -p gold200 -o "D:/out" --save-creative
+# 同一风格的冷调变体；0 为旧版基线，0.6 为较克制的强度
+"$PY" "$S" -i "D:/photos/one.jpg" -p gold200 --creative-direction cool --style-strength 0.6
+
 # 单张微调（不改预设文件；一次可以叠多个）
 "$PY" "$S" -i a.jpg -p superia400 --grain 1.6 --halation 0.6 --vignette 0.25 --sat 0.9 \
         --exposure 0.3 --temp -0.2 --tint 0.1 --acutance 0.2
@@ -110,11 +137,17 @@ S="scripts/film_emulate.py"
 
 # 套外部 3D LUT（与预设曲线叠加，strength 控制混合）
 "$PY" "$S" -i "D:/photos" -p neutral --lut "D:/luts/Kodak2383.cube" --lut-strength 0.8
+
+# 江南园林参考图复刻：冷调主版 / 暖光变体（分别处理适合的原片）
+"$PY" "$S" -i "D:/photos/garden.jpg" -p jiangnan_cool -o "D:/out"
+"$PY" "$S" -i "D:/photos/candle.jpg" -p jiangnan_amber -o "D:/out"
 ```
 
-关键参数：`--jobs`(默认 min(6,CPU))、`--quality`(默认 96，4:4:4)、`--max-edge`(预览降采样)、`--seed`(颗粒种子，固定即复现)、`--suffix`、`--limit`、`--dry-run`、`--group`、`--pattern`。
+关键参数：`--style-strength`(0=旧版，1=显著版默认)、`--creative-direction`(auto/warm/cool/vivid/soft)、`--save-creative`(导出胶卷处理前中间图)、`--jobs`(默认 min(6,CPU))、`--quality`(默认 96，4:4:4)、`--max-edge`(预览降采样)、`--seed`(颗粒种子，固定即复现)、`--suffix`、`--limit`、`--dry-run`、`--group`、`--pattern`。
 
 ## 预设
+
+下表的曲线与颗粒数字是旧版基础预设值；默认显著版由 `ENHANCED_TARGETS` 与再创作阶段插值生成。具体预览以同一原片的 `--style-strength 0` / `1` 对照为准。
 
 ### 富士 FUJI
 
@@ -142,9 +175,16 @@ S="scripts/film_emulate.py"
 | `tri_x` / `hp5` | 黑白（柯达硬调 / 伊尔福中性） | 纪实黑白 |
 | `neutral` | 仅抬黑+极轻颗粒 | 对照组 |
 
+### 参考画面复刻
+
+| preset | 风格 | 适合 |
+|---|---|---|
+| `jiangnan_cool` | 青黑暗部、灰紫木石、低饱和青绿、淡黄绿亮部 | 园林、绿植、木石、屋檐、阴天窗景 |
+| `jiangnan_amber` | 深褐黑环境、奶油高光、局部烛光琥珀 | 原片确有暖室内灯、烛光或夕照 |
+
 ## 管线（改参数前先理解）
 
-`sRGB → 白平衡/曝光 → 每通道曲线 LUT（含暗部硬度）→ 通道色偏 crossover → 色相带调整 → 黑白混合/外部3D LUT → acutance → 饱和度分档 → 高光溢出 → 颗粒 → 暗角 → sRGB`
+`源判定/基础还原 → 独立色彩与光影再创作 → 白平衡/曝光 → 每通道曲线 LUT（含暗部硬度）→ 通道色偏 crossover → 色相带调整 → 黑白混合/外部3D LUT → acutance → 饱和度分档 → 高光溢出 → 颗粒 → 暗角 → sRGB`
 
 按顺序的直觉：
 1. **曲线 LUT**：`contrast`(S 曲线) / `shoulder`+`shoulder_k`(高光滚降起点与陡度) / `shadow_contrast`(暗部硬度，正=压暗，负=提暗) / `toe`(暗部软着陆) / `lift`(黑位抬升=哑光黑) / `gamma`(每通道中间调位置)。
@@ -162,7 +202,7 @@ S="scripts/film_emulate.py"
 2. **`np.fft.rfft2` 只对最后一轴取半谱**：轴 0 的频率要用 `fftfreq(h)`，轴 1 用 `rfftfreq(w)`。两者都用 `rfftfreq` 会得到形状不匹配的广播错误（`(266,201)` vs `(134,201)`）。
 3. **`.cube` 轴的顺序**：文件里 **r 变化最快**，所以 `reshape(n,n,n,3)` 得到的轴 0 是 **b**，必须 `.transpose(2,1,0,3)` 才是 `data[r,g,b]`。搞错会出现"identity LUT 往返误差 0.99"或"红蓝互换 LUT 毫无作用"。
 4. **acutance 必须带 pad 边距**：锐化依赖邻域，分带处理若只拿带内像素，会在带边界留下水平接缝。做法是把 `arr[a0:a1]` 用同一套 `_prep`（曝光/白平衡/LUT）预处理后算 luma，模糊再裁回带内。
-5. **色相旋转用一阶近似**：`cos a≈1, sin a≈a`。位移通常在 10° 以内，误差可忽略，但换来零 `atan2`／零三角函数——24MP 下这是几秒的差别。权重用色带单位方向的余弦相似度，再乘 chroma 阈值权重，保证中性灰完全不动（实测偏移 0.000000）。
+5. **色相旋转按角度选近似**：小位移沿用一阶旧算法；显著版位移超过 0.3 rad 时改用高阶多项式，避免色度被误放大。权重仍乘 chroma 阈值，保护中性灰。
 6. **Windows 下 `glob` 大小写不敏感**：`*.JPG` 会把 `xxx.jpg` 一起抓进来，批量前用 `--pattern` 正则锁死。
 7. **EXIF 方向**：必须 `ImageOps.exif_transpose`，否则竖拍图是横的；保存时把 `274` 置 1 防止二次旋转。
 8. **JPEG 必须 `subsampling=0`**：默认 4:2:0 会抹掉色度颗粒与细边缘，胶片颗粒是高频信号，一定用 4:4:4。带颗粒的输出体积比原片大 20–40%，嫌大就 `--quality 92`。
@@ -221,4 +261,3 @@ S="scripts/film_emulate.py"
 ## 富士 / 柯达的设计依据
 
 见 `docs/fuji-color-science.md`：逐款性格、资料来源、富士特征 → 参数落点映射表、高光/暗部的复现清单、已知局限（是风格复现，不是物理仿真）。逐款完整数值见 `docs/preset-reference.md`。
-

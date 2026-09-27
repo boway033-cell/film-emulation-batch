@@ -813,16 +813,18 @@ def develop_raw(path, anchor="reference-tone", denoise="off", exposure=0.0,
                 knee=DEFAULT_KNEE, knee_k=DEFAULT_KNEE_K):
     """RAW → 线性 → 中性 sRGB。返回 (uint8 arr, meta)
 
-    anchor='reference-tone'（默认）对齐同目录同名成片的中位亮度，再套上**参考成片的色调
-                            形状** —— 结果与相机直出的观感一致，判据实测比 reference 好一倍
-                            （与「相机 JPEG + 预设」的均差：12.8~19.6 vs 23~30）
+    anchor='reference-tone'（默认）对齐同目录同名成片的中位亮度，再按亮度套上参考成片
+                            的色调形状；近白高光场景需预览确认，异常时改 reference
     anchor='reference'      只对齐参考成片的中位亮度，不套色调形状（更「中性」，但高光偏平）
     anchor='auto'           无参考成片时把 99.5% 分位锚定到 sRGB 0.95（上限 +4 EV）
     anchor='none'           完全不动曝光
     显影固定：相机白平衡、不自动提亮、sRGB 色彩空间、16bit 内部精度。
     """
     import rawpy
+    # 后续曝光锚定、参考成片匹配与 render_neutral 都按线性反射率计算。
+    # rawpy 默认 gamma=(2.222, 4.5) 会先编码 Rec.709；这里必须显式取线性输出。
     params = dict(use_camera_wb=True, no_auto_bright=True, output_bps=16,
+                  gamma=(1, 1),
                   output_color=rawpy.ColorSpace.sRGB)
     if denoise in ("light", "full"):
         params["fbdd_noise_reduction"] = (rawpy.FBDDNoiseReductionMode.Light
@@ -863,7 +865,14 @@ def develop_raw(path, anchor="reference-tone", denoise="off", exposure=0.0,
             r = _thumb(ImageOps.exif_transpose(Image.open(ref_path)).convert("RGB"), 760)
             rl = srgb_to_linear(np.asarray(r, np.float32) / 255.0)
             ka, kb = _tone_transfer_lut(lin, rl)
-            lin = np.interp(np.clip(lin, 0.0, float(ka[-1])), ka, kb).astype(np.float32)
+            # 分位曲线由亮度拟合，只作用到亮度；同一像素的 RGB 使用同一增益。
+            # 逐通道 np.interp 会放大高光里微小的通道差异，在近白天空形成青紫色带。
+            for y0 in range(0, lin.shape[0], 512):
+                band = lin[y0:y0 + 512]
+                lum = (band @ LUMA).astype(np.float32)
+                mapped = np.interp(np.clip(lum, 0.0, float(ka[-1])), ka, kb).astype(np.float32)
+                scale = np.divide(mapped, lum, out=np.zeros_like(lum), where=lum > 1e-6)
+                band *= scale[..., None]
             tone = True
             note += "；叠加参考成片的色调形状（reference-tone）"
         except Exception as e:

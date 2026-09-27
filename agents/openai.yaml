@@ -1,0 +1,6 @@
+interface:
+  display_name: "本地胶片调色与参考图复刻"
+  short_description: "先还原、再创作色彩光影，最后复刻胶片与园林电影色"
+  default_prompt: "使用 $film-emulation-batch 先判断 RAW/Log/普通成片并还原，再创作色彩光影，最后做胶卷调色；给出选片理由、三阶段图和旧新版对比。"
+policy:
+  allow_implicit_invocation: true

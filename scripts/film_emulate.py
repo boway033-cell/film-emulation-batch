@@ -3,6 +3,7 @@
 film_emulate.py — 本地胶片感批量模拟引擎
 
 管线：**源归一化**（RAW 显影 / 灰片反 log → 中性 sRGB）
+      → **色彩与光影再创作**（独立 sRGB 中间图，可选保存）
       → 每通道曲线 LUT（黑位抬升 / S 曲线 / 趾部 / 肩部滚降）
       → 亮度假用插值的独立通道色偏（crossover）→ 可选外部 3D LUT
       → 色彩饱和（暗部 / 中间调 / 高光分档）→ 高光溢出（halation，线性亮度阈值）
@@ -192,9 +193,16 @@ def hue_shift(rgb: np.ndarray, bands: dict) -> np.ndarray:
 
     if not np.any(angle) and not np.any(gain != 1.0):
         return rgb
-    # 一阶近似旋转：cos(a)≈1, sin(a)≈a（|a| 通常 < 0.3 rad，误差可忽略且不引入三角函数）
-    Cb2 = (Cb - angle * Cr) * gain
-    Cr2 = (angle * Cb + Cr) * gain
+    # 小位移沿用旧算法；大位移用多项式近似三角函数，避免强化后色度虚增。
+    if float(np.max(np.abs(angle))) <= 0.3:
+        Cb2 = (Cb - angle * Cr) * gain
+        Cr2 = (angle * Cb + Cr) * gain
+    else:
+        a2 = angle * angle
+        ca = 1.0 - 0.5 * a2 + a2 * a2 / 24.0
+        sa = angle * (1.0 - a2 / 6.0 + a2 * a2 / 120.0)
+        Cb2 = (ca * Cb - sa * Cr) * gain
+        Cr2 = (sa * Cb + ca * Cr) * gain
     R = Y + Cr2
     B = Y + Cb2
     G = (Y - 0.299 * R - 0.114 * B) / 0.587
@@ -208,6 +216,35 @@ def wb_gain(temp: float, tint: float) -> np.ndarray:
                   1.0 - 0.05 * n,
                   1.0 - 0.07 * t + 0.030 * n], dtype=np.float32)
     return g
+
+
+def creative_color_light(rgb: np.ndarray, direction: str, strength: float) -> np.ndarray:
+    """基础还原之后的独立再创作：分区光影、冷暖分色与色度塑形。"""
+    if strength <= 0:
+        return rgb
+    lum = luma_of(rgb)
+    sh = np.clip((0.55 - lum) / 0.55, 0.0, 1.0) ** 1.5
+    hi = np.clip((lum - 0.45) / 0.55, 0.0, 1.0) ** 1.5
+    if direction == "warm":
+        rgb = rgb + strength * (sh[..., None] * np.array([0.014, 0.003, -0.018], np.float32)
+                                + hi[..., None] * np.array([0.035, 0.015, -0.026], np.float32))
+        chroma_gain, punch = 1.06, 0.12
+    elif direction == "cool":
+        rgb = rgb + strength * (sh[..., None] * np.array([-0.026, 0.008, 0.030], np.float32)
+                                + hi[..., None] * np.array([-0.009, 0.004, 0.012], np.float32))
+        chroma_gain, punch = 0.98, 0.14
+    elif direction == "vivid":
+        chroma_gain, punch = 1.22, 0.22
+    elif direction == "soft":
+        chroma_gain, punch = 0.86, -0.13
+    else:  # mono: 仅做黑白影调，不重新引入颜色
+        chroma_gain, punch = 1.0, 0.15
+    lum = luma_of(rgb)
+    target_lum = lum + strength * punch * (smoothstep(lum) - lum)
+    if direction == "soft":
+        target_lum = target_lum * (1.0 - 0.060 * strength) + 0.030 * strength
+    rgb = target_lum[..., None] + (rgb - lum[..., None]) * (1.0 + (chroma_gain - 1.0) * strength)
+    return rgb
 
 
 def _prep(block: np.ndarray, lut: np.ndarray, ev: float, wb: np.ndarray | None) -> np.ndarray:
@@ -306,7 +343,8 @@ def build_halo_mask(arr: np.ndarray, hal: dict, w: int, h: int) -> np.ndarray:
     wide = gauss_blur_fft(m, r_wide)
     tight = gauss_blur_fft(m, r_tight)
 
-    halo = np.clip(wide * 0.78 + tight * 0.55, 0.0, 1.0)
+    halo = np.clip(wide * 0.78 + tight * 0.55
+                   - m * hal.get("core_protect", 0.0), 0.0, 1.0)
     halo = Image.fromarray((halo * 255.0).astype(np.uint8), mode="L").resize((w, h), Image.BILINEAR)
     return np.asarray(halo, dtype=np.uint8)
 
@@ -331,6 +369,20 @@ def grain_band(rng, y0, y1, h, w, sigma, chroma_amt):
     if chroma_amt > 0:
         chroma = rng.standard_normal((y1 - y0, w, 3)).astype(np.float32)
     return mono, chroma
+
+
+def apply_creative_stage(arr: np.ndarray, preset: dict) -> np.ndarray:
+    """阶段二：对已还原色彩的照片再创作，返回可交给胶卷引擎的 sRGB 图。"""
+    strength = preset.get("creative_strength", 0.0)
+    if strength <= 0:
+        return arr
+    out = np.empty_like(arr)
+    for y0 in range(0, arr.shape[0], BAND):
+        y1 = min(y0 + BAND, arr.shape[0])
+        base = arr[y0:y1].astype(np.float32) / 255.0
+        graded = creative_color_light(base, preset["creative_direction"], strength)
+        out[y0:y1] = np.clip(graded * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return out
 
 
 # ══════════════════════════════════════════════════════════ 主渲染
@@ -392,7 +444,7 @@ def render(arr: np.ndarray, preset: dict, seed: int = 20260926,
     for y0 in range(0, h, BAND):
         y1 = min(y0 + BAND, h)
 
-        # 0) 曝光 → 白平衡 → 每通道曲线 LUT
+        # 0) 输入已完成源还原和色彩再创作；从这里开始胶卷模拟。
         blk = _prep(arr[y0:y1].astype(np.float32) / 255.0, lut, ev, wb)
         lum = luma_of(blk)
 
@@ -443,7 +495,9 @@ def render(arr: np.ndarray, preset: dict, seed: int = 20260926,
         # 7) 颗粒
         if g_amt > 0:
             mono, chroma = grain_band(rng, y0, y1, h, w, g_sigma, g_chroma)
-            amp = (g_amt * 5.0 / 255.0) * (0.40 + 0.85 * (4.0 * lum * (1.0 - lum)))
+            # 缩图预览模拟全尺寸调色后再缩小的颗粒衰减，避免预览出现假性粗噪。
+            preview_factor = max(0.30, math.sqrt(min(1.0, res_scale)))
+            amp = (g_amt * 5.0 / 255.0) * preview_factor * (0.40 + 0.85 * (4.0 * lum * (1.0 - lum)))
             blk += (mono * amp)[..., None]
             if chroma is not None:
                 blk += chroma * (amp * g_chroma)[..., None]
@@ -683,6 +737,45 @@ PRESETS = {
         "acutance": {"amount": 0.06, "radius": 1.1},
         "vignette": 0.05,
     },
+    # ─────────────── 参考画面复刻：江南园林电影色 ───────────────
+    "jiangnan_cool": {
+        "label": "江南园林·冷青绿",
+        "note": "参考古风园林剧照：深青黑阴影、灰紫木石、低饱和青绿、淡黄绿高光；宜园林/旧建筑/植物",
+        "temp": -0.22, "tint": 0.035, "exposure": -0.08,
+        "curve": {"contrast": 0.24, "shoulder": 0.73, "shoulder_k": 2.5,
+                  "shadow_contrast": 0.24, "toe": 0.07,
+                  "lift": [0.007, 0.010, 0.013], "gamma": [0.98, 1.00, 1.02]},
+        "crossover": {"shadow": [-0.012, 0.004, 0.013],
+                      "highlight": [0.005, 0.010, -0.010]},
+        "hue_bands": {"green": {"hue": 9, "sat": -0.08, "width": 55},
+                      "yellow": {"hue": 4, "sat": -0.15},
+                      "orange": {"sat": -0.10}, "red": {"sat": -0.10}},
+        "sat": 0.80, "sat_hi": 0.76, "sat_sh": 0.86,
+        "grain": {"amount": 0.45, "size": 0.80, "chroma": 0.08},
+        "halation": {"amount": 0.12, "threshold": 0.85, "radius": 0.005,
+                     "tint": [1.0, 0.78, 0.55]},
+        "acutance": {"amount": 0.04, "radius": 1.0},
+        "vignette": 0.10,
+    },
+    "jiangnan_amber": {
+        "label": "江南园林·烛光琥珀",
+        "note": "同组参考画面的室内暖光分支：深褐黑环境、奶油高光、克制的烛火琥珀；宜室内窗光/烛光",
+        "temp": 0.18, "tint": -0.02, "exposure": -0.08,
+        "curve": {"contrast": 0.25, "shoulder": 0.74, "shoulder_k": 2.5,
+                  "shadow_contrast": 0.24, "toe": 0.06,
+                  "lift": [0.009, 0.007, 0.008], "gamma": [1.02, 1.00, 0.96]},
+        "crossover": {"shadow": [0.002, -0.004, -0.010],
+                      "highlight": [0.018, 0.008, -0.014]},
+        "hue_bands": {"green": {"hue": -2, "sat": -0.18},
+                      "yellow": {"sat": -0.06}, "orange": {"sat": 0.03},
+                      "red": {"sat": -0.12}},
+        "sat": 0.83, "sat_hi": 0.78, "sat_sh": 0.88,
+        "grain": {"amount": 0.40, "size": 0.80, "chroma": 0.08},
+        "halation": {"amount": 0.24, "threshold": 0.80, "radius": 0.006,
+                     "tint": [1.0, 0.67, 0.33]},
+        "acutance": {"amount": 0.03, "radius": 1.0},
+        "vignette": 0.11,
+    },
     # ─────────────── 黑白 ───────────────
     "acros": {
         "label": "Fuji ACROS 100",
@@ -743,8 +836,85 @@ PRESETS = {
 FUJI_PRESETS = ["superia400", "classic_neg", "c200", "pro400h",
                 "velvia50", "provia100f", "classic_chrome", "eterna", "acros"]
 KODAK_PRESETS = ["portra400", "gold200", "ektar100", "kodachrome", "cinestill800t", "tri_x"]
+REFERENCE_PRESETS = ["jiangnan_cool", "jiangnan_amber"]
 
 TUNE_KEYS = ("grain", "halation", "vignette", "sat", "contrast", "exposure")
+
+# 显著版的创作目标；数字是本工具的视觉设计值，不声称为原厂配方。
+# (中间调饱和度, 曲线对比, 颗粒量)。低饱和风格通过更明显的分色和影调体现。
+ENHANCED_TARGETS = {
+    "portra400": (0.97, 0.23, 1.25), "gold200": (1.14, 0.31, 1.55),
+    "ektar100": (1.30, 0.43, 0.65), "kodachrome": (1.16, 0.48, 1.10),
+    "cinestill800t": (1.04, 0.32, 1.95),
+    "superia400": (0.93, 0.37, 1.55), "classic_neg": (0.83, 0.46, 1.45),
+    "c200": (0.95, 0.28, 1.35), "pro400h": (0.78, 0.09, 0.90),
+    "velvia50": (1.30, 0.54, 0.45), "provia100f": (1.10, 0.34, 0.55),
+    "classic_chrome": (0.68, 0.28, 0.90), "eterna": (0.66, 0.09, 0.80),
+    "jiangnan_cool": (0.65, 0.40, 0.75), "jiangnan_amber": (0.73, 0.40, 0.70),
+    "acros": (1.00, 0.36, 1.25), "hp5": (1.00, 0.39, 3.20),
+    "tri_x": (1.00, 0.53, 3.90),
+}
+
+AUTO_CREATIVE_DIRECTIONS = {
+    "portra400": "soft", "gold200": "warm", "ektar100": "vivid",
+    "kodachrome": "warm", "cinestill800t": "cool",
+    "superia400": "cool", "classic_neg": "cool", "c200": "cool",
+    "pro400h": "soft", "velvia50": "vivid", "provia100f": "vivid",
+    "classic_chrome": "cool", "eterna": "soft",
+    "jiangnan_cool": "cool", "jiangnan_amber": "warm",
+    "acros": "mono", "hp5": "mono", "tri_x": "mono",
+}
+
+
+def styled_preset(name: str, strength: float = 1.0, direction: str = "auto") -> dict:
+    """0=旧版，1=显著版；neutral 始终作为不强化的对照组。"""
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("style strength must be between 0 and 1")
+    p = apply_overrides(PRESETS[name])
+    if name == "neutral" or strength == 0:
+        return p
+    p["creative_direction"] = (AUTO_CREATIVE_DIRECTIONS[name] if direction == "auto"
+                               else direction)
+    p["creative_strength"] = strength
+    sat, contrast, grain = ENHANCED_TARGETS[name]
+    mix = lambda a, b: a + (b - a) * strength
+    old_sat = p.get("sat", 1.0)
+    p["sat"] = mix(old_sat, sat)
+    p["sat_hi"] = mix(p.get("sat_hi", old_sat), sat + 1.35 * (p.get("sat_hi", old_sat) - old_sat))
+    p["sat_sh"] = mix(p.get("sat_sh", old_sat), sat + 1.35 * (p.get("sat_sh", old_sat) - old_sat))
+    p["curve"]["contrast"] = mix(p["curve"]["contrast"], contrast)
+    if "shadow_contrast" in p["curve"]:
+        p["curve"]["shadow_contrast"] *= 1.0 + 0.55 * strength
+    p["curve"]["gamma"] = [1.0 + (v - 1.0) * (1.0 + 0.6 * strength)
+                              for v in p["curve"]["gamma"]]
+    p["temp"] = p.get("temp", 0.0) * (1.0 + 1.25 * strength)
+    p["tint"] = p.get("tint", 0.0) * (1.0 + 0.8 * strength)
+    if "crossover" in p:
+        p["crossover"] = {key: [v * (1.0 + 1.35 * strength) for v in values]
+                          for key, values in p["crossover"].items()}
+    if "hue_bands" in p:
+        p["hue_bands"] = {
+            band: {**cfg,
+                   "hue": cfg.get("hue", 0.0) * (1.0 + 1.4 * strength),
+                   "sat": cfg.get("sat", 0.0) * (1.0 + 0.40 * strength)}
+            for band, cfg in p["hue_bands"].items()}
+    if name == "velvia50":
+        # 已饱和的绿植不再按统一增益推到荧光色；靠深影与整体色彩维持 Velvia 观感。
+        p["hue_bands"]["green"]["sat"] = mix(p["hue_bands"]["green"]["sat"], 0.20)
+    p["grain"]["amount"] = mix(p["grain"].get("amount", 0.0), grain)
+    p["grain"]["size"] = p["grain"].get("size", 1.0) * (1.0 + 0.10 * strength)
+    if p["halation"].get("amount", 0.0):
+        halo_mult = 2.0 if name == "cinestill800t" else 1.35
+        p["halation"]["amount"] *= 1.0 + (halo_mult - 1.0) * strength
+        p["halation"]["threshold"] -= 0.025 * strength
+        if name == "cinestill800t":
+            # 强点光保留红晕；大面积 LED 灯带避免铺成白斑。
+            p["halation"]["amount"] = mix(p["halation"]["amount"], 0.88)
+            p["halation"]["threshold"] = mix(p["halation"]["threshold"], 0.82)
+            p["halation"]["radius"] = mix(p["halation"]["radius"], 0.008)
+            p["halation"]["core_protect"] = 0.9 * strength
+    p["vignette"] = min(0.28, p.get("vignette", 0.0) * (1.0 + 0.15 * strength))
+    return p
 
 
 def apply_overrides(preset: dict, grain=None, halation=None, vignette=None,
@@ -814,9 +984,23 @@ def process_one(job) -> tuple:
     try:
         img, info = _load_rgb(path, max_edge, opts.get("prep"))
         arr = np.asarray(img, dtype=np.uint8)
-        p = apply_overrides(PRESETS[preset_name], **opts["override"])
+        p = apply_overrides(styled_preset(preset_name, opts.get("style_strength", 1.0),
+                                          opts.get("creative_direction", "auto")),
+                            **opts["override"])
         lut3d = CubeLUT(opts["lut"]) if opts.get("lut") else None
-        res = render(arr, p, seed=opts["seed"], res_scale=opts.get("res_scale", 1.0),
+        scale = opts.get("res_scale", 1.0)
+        if max_edge and os.path.splitext(path)[1].lower() not in (SN.RAW_EXTS if SN else set()):
+            with Image.open(path) as original:
+                scale = min(1.0, max(img.size) / max(original.size))
+        creative = apply_creative_stage(arr, p)
+        if opts.get("save_creative") and creative is not arr:
+            stage_dir = os.path.join(os.path.dirname(out_path), "creative-stage")
+            os.makedirs(stage_dir, exist_ok=True)
+            stage_name = os.path.splitext(os.path.basename(out_path))[0] + "_creative.jpg"
+            Image.fromarray(creative, "RGB").save(os.path.join(stage_dir, stage_name),
+                                                   quality=quality, subsampling=0)
+        del arr
+        res = render(creative, p, seed=opts["seed"], res_scale=scale,
                      lut3d=lut3d, lut_strength=opts.get("lut_strength", 1.0))
         exif = None
         if "exif" in img.info:
@@ -861,8 +1045,11 @@ def build_sheet(src: str, out_path: str, names: list[str], max_edge: int = 1400,
 
     tiles = [("原图 (Original)", np.asarray(base, dtype=np.uint8))]
     for n in names:
-        p = apply_overrides(PRESETS[n], **(opts.get("override") or {}))
-        r = render(arr, p, seed=seed, res_scale=scale,
+        p = apply_overrides(styled_preset(n, opts.get("style_strength", 1.0),
+                                          opts.get("creative_direction", "auto")),
+                            **(opts.get("override") or {}))
+        creative = apply_creative_stage(arr, p)
+        r = render(creative, p, seed=seed, res_scale=scale,
                    lut3d=CubeLUT(opts["lut"]) if opts.get("lut") else None,
                    lut_strength=opts.get("lut_strength", 1.0))
         tiles.append((PRESETS[n]["label"], r))
@@ -872,10 +1059,14 @@ def build_sheet(src: str, out_path: str, names: list[str], max_edge: int = 1400,
     W = cols * w + (cols + 1) * pad
     H = rows * (h + cap) + (rows + 1) * pad
     sheet = Image.new("RGB", (W, H), (24, 24, 26))
-    try:
+    font = None
+    for candidate in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf",
+                      "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc"):
+        if os.path.isfile(candidate):
+            font = ImageFont.truetype(candidate, 20)
+            break
+    if font is None:
         font = ImageFont.load_default(size=20)
-    except Exception:
-        font = ImageFont.load_default()
     draw = ImageDraw.Draw(sheet)
     for i, (label, t) in enumerate(tiles):
         r, c = divmod(i, cols)
@@ -958,6 +1149,14 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=20260926, help="颗粒随机种子（同种子结果可复现）")
     ap.add_argument("--lut", default=None, help="外部 .cube 3D LUT 路径")
     ap.add_argument("--lut-strength", type=float, default=1.0, help="3D LUT 混合强度")
+    ap.add_argument("--style-strength", type=float, default=1.0,
+                    help="内置风格强度：1=显著版（默认），0=旧版，0~1 可微调；neutral 不强化")
+    ap.add_argument("--creative-direction", default="auto",
+                    choices=["auto", "warm", "cool", "vivid", "soft"],
+                    help="再创作方向：auto=随预设；warm=琥珀暖调；cool=青蓝暗部；"
+                         "vivid=浓艳反差；soft=柔和粉彩")
+    ap.add_argument("--save-creative", action="store_true",
+                    help="保存胶卷处理前的色彩再创作中间图，便于核对三阶段流程")
     ap.add_argument("--grain", type=float, default=None, help="覆盖颗粒强度（预设值 × 此系数外的绝对值）")
     ap.add_argument("--halation", type=float, default=None, help="覆盖高光溢出强度")
     ap.add_argument("--vignette", type=float, default=None, help="覆盖暗角强度")
@@ -995,6 +1194,9 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="只列文件，不处理")
     args = ap.parse_args(argv)
 
+    if not 0.0 <= args.style_strength <= 1.0:
+        ap.error("--style-strength 必须在 0 到 1 之间")
+
     if args.prep_knee is None:
         args.prep_knee = SN.DEFAULT_KNEE if SN else 0.90
     if args.prep_knee_k is None:
@@ -1020,6 +1222,7 @@ def main(argv=None):
                 print(f"{k:<16} {v['label']:<28} {v['note']}")
         dump("富士 FUJI", FUJI_PRESETS)
         dump("柯达 / 其他 KODAK & OTHERS", KODAK_PRESETS + ["hp5"])
+        dump("参考画面复刻", REFERENCE_PRESETS)
         dump("对照", ["neutral"])
         print()
         return 0
@@ -1032,6 +1235,9 @@ def main(argv=None):
         "seed": args.seed,
         "lut": args.lut,
         "lut_strength": args.lut_strength,
+        "style_strength": args.style_strength,
+        "creative_direction": args.creative_direction,
+        "save_creative": args.save_creative,
         "res_scale": 1.0,
         "override": {
             "grain": args.grain, "halation": args.halation, "vignette": args.vignette,
@@ -1122,7 +1328,7 @@ def main(argv=None):
         for j in jobs:
             p, o, good, t, err, note = process_one(j)
             ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
-            print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}"
+            print(("  [OK] " if good else "  [ERR] ") + os.path.basename(o) + f"  {t}"
                   + (f"  [{note}]" if note else "")
                   + ("" if good else "\n" + err))
     else:
@@ -1131,7 +1337,7 @@ def main(argv=None):
             for fu in as_completed(futs):
                 p, o, good, t, err, note = fu.result()
                 ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
-                print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}"
+                print(("  [OK] " if good else "  [ERR] ") + os.path.basename(o) + f"  {t}"
                       + (f"  [{note}]" if note else "")
                       + ("" if good else "\n" + err))
 
