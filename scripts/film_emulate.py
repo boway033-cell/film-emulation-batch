@@ -2,12 +2,20 @@
 """
 film_emulate.py — 本地胶片感批量模拟引擎
 
-管线：sRGB 输入 → 每通道曲线 LUT（黑位抬升 / S 曲线 / 趾部 / 肩部滚降）
+管线：**源归一化**（RAW 显影 / 灰片反 log → 中性 sRGB）
+      → 每通道曲线 LUT（黑位抬升 / S 曲线 / 趾部 / 肩部滚降）
       → 亮度假用插值的独立通道色偏（crossover）→ 可选外部 3D LUT
       → 色彩饱和（暗部 / 中间调 / 高光分档）→ 高光溢出（halation，线性亮度阈值）
       → 高斯颗粒（单色 + 色度，亮度调制）→ 暗角 → sRGB 输出
 
-依赖：Pillow + numpy。纯本地、无网络、无 API。
+源归一化在 `--source`（默认 auto）控制下自动判断输入色彩格式：
+  · RAW（ARW/CR2/NEF/DNG…）→ 显影成中性 sRGB（只需显影，RAW 不受机内 Log 影响）
+  · 灰片 / Log 成片 → 反 log 还原成线性反射率再编码（先判断，再还原）
+  · 普通成片（含手机照片）→ 原样通过
+理由见 source_normalize.py 顶部的说明；预设是按「已正常显影的 sRGB 成片」标定的，
+把 RAW 或灰片直接喂进来，等于让预设建在错误的对比与饱和度基准上。
+
+依赖：Pillow + numpy（RAW 另需 rawpy）。纯本地、无网络、无 API。
 内存策略：分带（band）处理 + 半分辨率光晕，24MP 单张峰值占用 < 200MB。
 """
 
@@ -15,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import os
 import re
@@ -24,6 +33,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
+
+try:
+    import source_normalize as SN
+except Exception:                                    # 允许单独拷走本文件使用
+    SN = None
 
 LUT_N = 4096          # 一维曲线 LUT 精度（1/4096 量化，肉眼不可见）
 BAND = 512            # 分带高度（行）
@@ -763,50 +777,86 @@ def apply_overrides(preset: dict, grain=None, halation=None, vignette=None,
 
 
 # ══════════════════════════════════════════════════════════ 单文件处理
-def _load_rgb(path: str, max_edge: int | None = None) -> Image.Image:
+def _load_rgb(path: str, max_edge: int | None = None, prep: dict | None = None):
+    """读图。prep 存在且模式非 standard/off 时，先做源归一化（RAW 显影 / 反 log）。
+
+    返回 (PIL.Image, SourceInfo | None)
+    """
+    info = None
+    if prep and SN is not None and prep.get("mode", "auto") not in ("standard", "off"):
+        info = (prep.get("probes") or {}).get(os.path.abspath(path))
+        try:
+            img, info = SN.normalize(
+                path, info=info, source=prep.get("mode", "auto"),
+                log_profile=prep.get("log_profile", "auto"),
+                raw_anchor=prep.get("raw_anchor", "reference-tone"),
+                raw_denoise=prep.get("raw_denoise", "off"),
+                exposure=prep.get("exposure", 0.0),
+                knee=prep.get("knee", SN.DEFAULT_KNEE),
+                knee_k=prep.get("knee_k", SN.DEFAULT_KNEE_K),
+                max_edge=max_edge)
+            if img is not None:
+                return img, info
+        except Exception:
+            pass                                     # 归一化失败则退回直接读取
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
     img = img.convert("RGB")
     if max_edge and max(img.size) > max_edge:
         r = max_edge / max(img.size)
         img = img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
-    return img
+    return img, info
 
 
 def process_one(job) -> tuple:
-    (path, out_path, preset_name, opts, quality, max_edge) = job
+    (path, out_path, preset_name, opts, quality, max_edge) = job[:6]
     t0 = time.time()
     try:
-        img = _load_rgb(path, max_edge)
+        img, info = _load_rgb(path, max_edge, opts.get("prep"))
         arr = np.asarray(img, dtype=np.uint8)
         p = apply_overrides(PRESETS[preset_name], **opts["override"])
         lut3d = CubeLUT(opts["lut"]) if opts.get("lut") else None
         res = render(arr, p, seed=opts["seed"], res_scale=opts.get("res_scale", 1.0),
                      lut3d=lut3d, lut_strength=opts.get("lut_strength", 1.0))
-        exif = img.getexif()
-        try:
-            exif[274] = 1
-        except Exception:
-            pass
+        exif = None
+        if "exif" in img.info:
+            try:
+                exif = img.info["exif"]
+            except Exception:
+                exif = None
+        else:
+            try:
+                ex = img.getexif()
+                ex[274] = 1
+                exif = ex.tobytes()
+            except Exception:
+                exif = None
         out = Image.fromarray(res, "RGB")
         kw = {"quality": quality, "subsampling": 0, "optimize": True}
         if os.path.splitext(out_path)[1].lower() in (".jpg", ".jpeg"):
-            out.save(out_path, exif=exif.tobytes(), **kw)
+            out.save(out_path, exif=exif, **kw)
         else:
             out.save(out_path)
-        return (path, out_path, True, f"{time.time() - t0:.1f}s", "")
+        note = ""
+        if info is not None:
+            note = f"{info.kind}" + (f"/{info.profile}" if info.profile else "") \
+                   + (f" {info.confidence}" if info.confidence not in ("-", "") else "")
+        return (path, out_path, True, f"{time.time() - t0:.1f}s", "", note)
     except Exception as e:
         import traceback
-        return (path, out_path, False, f"{time.time() - t0:.1f}s", traceback.format_exc(limit=3) + str(e))
+        return (path, out_path, False, f"{time.time() - t0:.1f}s",
+                traceback.format_exc(limit=3) + str(e), "")
 
 
 # ══════════════════════════════════════════════════════════ 对比图
 def build_sheet(src: str, out_path: str, names: list[str], max_edge: int = 1400,
                 cols: int = 3, seed: int = 20260926, opts=None) -> str:
     opts = opts or {}
-    base = _load_rgb(src, max_edge)
+    base, _info = _load_rgb(src, max_edge, opts.get("prep"))
     w, h = base.size
-    scale = max(w, h) / max(Image.open(src).size)
+    full = Image.open(src) if os.path.splitext(src)[1].lower() not in (SN.RAW_EXTS if SN else set()) \
+        else base
+    scale = max(w, h) / max(full.size)
     arr = np.asarray(base, dtype=np.uint8)
 
     tiles = [("原图 (Original)", np.asarray(base, dtype=np.uint8))]
@@ -839,9 +889,10 @@ def build_sheet(src: str, out_path: str, names: list[str], max_edge: int = 1400,
 
 # ══════════════════════════════════════════════════════════ CLI
 IMG_RE = r"\.(?:jpe?g|png|tiff?|bmp|webp)$"
+RAW_RE = (r"\.(?:" + "|".join(sorted(e.lstrip(".") for e in SN.RAW_EXTS)) + r")$") if SN else None
 
 
-def collect(inputs, pattern=None, recursive=False, limit=None):
+def collect(inputs, pattern=None, recursive=False, limit=None, allow_raw=True):
     files = []
     for it in inputs:
         if os.path.isdir(it):
@@ -849,9 +900,46 @@ def collect(inputs, pattern=None, recursive=False, limit=None):
             files += [f for f in glob.glob(it, recursive=recursive) if os.path.isfile(f)]
         else:
             files += glob.glob(it)
-    rx = re.compile(pattern, re.I) if pattern else re.compile(IMG_RE, re.I)
+    if pattern:
+        rx = re.compile(pattern, re.I)
+    else:
+        rx = re.compile(IMG_RE + ("|" + RAW_RE if (allow_raw and RAW_RE) else ""), re.I)
     files = sorted({f for f in files if rx.search(os.path.basename(f))})
     return files[:limit] if limit else files
+
+
+def build_prep(args, files):
+    """构造源归一化配置，并在父进程里先探测一遍（RAW 探测要开文件，别放到子进程重复做）"""
+    mode = args.source
+    prep = {"mode": mode}
+    if SN is None or mode in ("standard", "off"):
+        return prep, []
+    prep.update({"log_profile": args.log_profile, "raw_anchor": args.raw_anchor,
+                 "raw_denoise": args.raw_denoise, "exposure": args.prep_exposure,
+                 "knee": args.prep_knee, "knee_k": args.prep_knee_k, "probes": {}})
+    infos = []
+    for f in files:
+        info = SN.probe(f)
+        prep["probes"][os.path.abspath(f)] = info
+        infos.append(info)
+    return prep, infos
+
+
+def print_prep_report(infos):
+    if not infos:
+        return
+    print("── 源格式判定与预处理 ──────────────────────────────────────────────")
+    print(f"{'文件':<24}{'判定':<13}{'置信':<8}处理")
+    for i in infos:
+        print(f"{i.name:<24}{i.kind:<13}{i.confidence:<8}{i.action}")
+        for r in i.reasons[:2]:
+            print(f"{'':<45}· {r}")
+        if i.note:
+            print(f"{'':<45}! {i.note}")
+    n = {}
+    for i in infos:
+        n[i.kind] = n.get(i.kind, 0) + 1
+    print("  汇总：" + "，".join(f"{k} {v} 个" for k, v in sorted(n.items())) + "\n")
 
 
 def main(argv=None):
@@ -883,9 +971,45 @@ def main(argv=None):
     ap.add_argument("--sheet-presets", default=None, help="对比图包含的预设（逗号分隔）")
     ap.add_argument("--group", default=None, choices=["fuji", "kodak", "all"],
                     help="按家族批量处理或生成对比图")
+    ap.add_argument("--source", default="auto",
+                    choices=["auto", "raw", "log", "standard", "off"],
+                    help="源归一化：auto=先判断色彩格式再决定（默认）；raw=强制显影 RAW；"
+                         "log=强制按灰片反 log；standard/off=跳过预处理")
+    ap.add_argument("--log-profile", default="auto",
+                    help="强制 log 曲线：" + (", ".join(SN.LOG_PROFILES) if SN else "无") + " 或 auto")
+    ap.add_argument("--raw-anchor", default="reference-tone",
+                    choices=["reference-tone", "reference", "auto", "none"],
+                    help="RAW 曝光锚定：reference-tone=对齐同目录同名成片的中位亮度并叠加其色调"
+                         "形状（默认，最接近相机直出观感）；reference=只对齐中位亮度；"
+                         "auto=无参考成片时按分位；none=不动")
+    ap.add_argument("--raw-denoise", default="off", choices=["off", "light", "full"],
+                    help="RAW 显影降噪强度（高 ISO 夜景可用 light）")
+    ap.add_argument("--prep-exposure", type=float, default=0.0, help="归一化阶段曝光补偿 EV")
+    ap.add_argument("--prep-knee", type=float, default=None, help="高光软肩起点（线性反射率，默认 0.90）")
+    ap.add_argument("--prep-knee-k", type=float, default=None, help="软肩压缩强度（默认 1.0）")
+    ap.add_argument("--no-prep-report", action="store_true", help="不打印源格式判定表")
+    ap.add_argument("--prep-json", default=None, help="把判定与归一化参数写入 JSON")
+    ap.add_argument("--no-raw", action="store_true", help="默认扫描时不纳入 RAW 文件")
     ap.add_argument("--list", action="store_true", help="列出全部预设")
+    ap.add_argument("--list-source-profiles", action="store_true", help="列出支持的 log 曲线与其指纹")
     ap.add_argument("--dry-run", action="store_true", help="只列文件，不处理")
     args = ap.parse_args(argv)
+
+    if args.prep_knee is None:
+        args.prep_knee = SN.DEFAULT_KNEE if SN else 0.90
+    if args.prep_knee_k is None:
+        args.prep_knee_k = SN.DEFAULT_KNEE_K if SN else 1.0
+
+    if args.list_source_profiles:
+        if SN is None:
+            print("source_normalize.py 不可用", file=sys.stderr)
+            return 2
+        print(f"{'profile':<11}{'名称':<38}{'基灰':>9}{'18%灰':>9}{'90%白':>9}")
+        print("-" * 108)
+        for k, v in SN.LOG_PROFILES.items():
+            print(f"{k:<11}{v['label']:<38}{v['floor']:>9.5f}{v['mid']:>9.5f}{v['white']:>9.5f}")
+            print(f"{'':<11}{v['source']}")
+        return 0
 
     if args.list:
         def dump(title, names):
@@ -922,12 +1046,21 @@ def main(argv=None):
         rc = 0
         for n in names:
             sub = list(argv) if argv else sys.argv[1:]
-            sub = [a for a in sub if a not in ("--group", args.group)]
+            drop = {"--group", args.group, "--prep-json"}
+            if args.prep_json:
+                drop.add(args.prep_json)
+            sub = [a for a in sub if a not in drop]
             rc = max(rc, main(sub + ["-p", n, "--output",
                                      os.path.join(args.output or ".", n)]))
         return rc
 
     if args.sheet:
+        files = [args.sheet]
+        if args.source not in ("standard", "off") and SN is not None:
+            prep, infos = build_prep(args, files)
+            opts["prep"] = prep
+            if not args.no_prep_report:
+                print_prep_report(infos)
         names = None
         if args.sheet_presets:
             names = args.sheet_presets.split(",")
@@ -951,10 +1084,20 @@ def main(argv=None):
         print("需要 -i 指定输入", file=sys.stderr)
         return 2
 
-    files = collect(args.input, args.pattern, args.recursive, args.limit)
+    files = collect(args.input, args.pattern, args.recursive, args.limit,
+                    allow_raw=not args.no_raw)
     if not files:
         print("没有匹配的文件", file=sys.stderr)
         return 2
+    prep, infos = build_prep(args, files)
+    opts["prep"] = prep
+    if not args.dry_run and not args.no_prep_report:
+        print_prep_report(infos)
+    if args.prep_json:
+        with open(args.prep_json, "w", encoding="utf-8") as fh:
+            json.dump([i.to_dict() for i in infos], fh, ensure_ascii=False, indent=2)
+        print(f"判定与还原参数 → {args.prep_json}")
+
     outdir = args.output or os.path.join(os.path.dirname(os.path.abspath(files[0])), f"film_{args.preset}")
     os.makedirs(outdir, exist_ok=True)
     suffix = args.suffix if args.suffix is not None else f"_{args.preset}"
@@ -977,16 +1120,20 @@ def main(argv=None):
     t0 = time.time()
     if args.jobs <= 1:
         for j in jobs:
-            p, o, good, t, err = process_one(j)
+            p, o, good, t, err, note = process_one(j)
             ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
-            print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}" + ("" if good else "\n" + err))
+            print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}"
+                  + (f"  [{note}]" if note else "")
+                  + ("" if good else "\n" + err))
     else:
         with ProcessPoolExecutor(max_workers=args.jobs) as ex:
             futs = [ex.submit(process_one, j) for j in jobs]
             for fu in as_completed(futs):
-                p, o, good, t, err = fu.result()
+                p, o, good, t, err, note = fu.result()
                 ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
-                print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}" + ("" if good else "\n" + err))
+                print(("  ✓ " if good else "  ✗ ") + os.path.basename(o) + f"  {t}"
+                      + (f"  [{note}]" if note else "")
+                      + ("" if good else "\n" + err))
 
     print(f"完成：成功 {ok}，失败 {fail}，总耗时 {time.time() - t0:.1f}s")
     return 0 if fail == 0 else 1

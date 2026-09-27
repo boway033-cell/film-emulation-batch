@@ -1,6 +1,6 @@
 ---
 name: film-emulation-batch
-description: 本地批量胶片感调色（胶片模拟）。用 Pillow+numpy 实现每通道曲线 LUT、色相带选择性调整（绿→青绿）、独立通道色偏(crossover)、暗部硬度、高斯颗粒、高光溢出(halation)、暗角、acutance，支持外部 .cube 3D LUT。含富士（Superia / 經典 Neg / C200 / Pro 400H / Velvia 50 / Provia 100F / Classic Chrome / Eterna / ACROS）与柯达（Portra / Gold / Ektar / Kodachrome / Cinestill / Tri-X）两族预设。当用户说"胶片感""胶片模拟""富士色调""青绿色""Portra 风格""加颗粒""光晕""把一批照片调成胶片"时使用。纯本地离线、无 API 费用。
+description: 本地批量胶片感调色（胶片模拟）。用 Pillow+numpy 实现每通道曲线 LUT、色相带选择性调整（绿→青绿）、独立通道色偏(crossover)、暗部硬度、高斯颗粒、高光溢出(halation)、暗角、acutance，支持外部 .cube 3D LUT。含富士（Superia / 經典 Neg / C200 / Pro 400H / Velvia 50 / Provia 100F / Classic Chrome / Eterna / ACROS）与柯达（Portra / Gold / Ektar / Kodachrome / Cinestill / Tri-X）两族预设。调色前会先判断源色彩格式：RAW 自动显影、相机灰片（S-Log3/S-Log2/V-Log/LogC3/LogC4/Apple Log）自动反 log 恢复原本色彩、普通成片与手机照片原样通过（手机拍的 Log 也会识别还原）。当用户说"胶片感""胶片模拟""富士色调""青绿色""Portra 风格""加颗粒""光晕""把一批照片调成胶片""处理 RAW""灰片还原""log 还原"时使用。纯本地离线、无 API 费用。
 agent_created: true
 ---
 
@@ -11,10 +11,57 @@ agent_created: true
 ## 何时用
 
 - 把一整个目录的照片批量套成某种胶片风格（富士 9 款 / 柯达 6 款 / 黑白）
-- 复现**富士的青绿色倾向**、**高光与暗部的色彩交叉**（见 `富士胶片色彩复现_资料与参数映射.md`）
+- 复现**富士的青绿色倾向**、**高光与暗部的色彩交叉**（见 `docs/fuji-color-science.md`）
 - 给照片加胶片颗粒、高光光晕、暗角、边缘锐度
 - 套用外部下载的 `.cube` 3D LUT
 - 需要**可复现**（固定随机种子 + 固定参数，两次跑出同一张图）
+- 输入是 **RAW 或相机灰片（Log）** ：默认会先自动判定并归一到正常色彩，再套预设
+
+## 先判源、再调色（默认开启）
+
+调色前必须先判断色彩格式。预设曲线全部按「已正常显影的 sRGB 成片」标定，
+RAW / Log 直接喂进去等于在错误基准上再叠一次对比与饱和。
+
+| 输入 | 判定 | 动作 |
+|---|---|---|
+| RAW（ARW / CR2 / CR3 / NEF / DNG / RAF / ORF / RW2 / PEF / SRW / X3F…） | `raw` | **只显影**（相机白平衡、不自动提亮、sRGB、16bit 内部精度） |
+| 相机灰片（S-Log3 / S-Log2 / V-Log / LogC3 / LogC4 / Apple Log） | `log` | 反 log → 线性反射率 → 中性 sRGB |
+| 扁平但曲线未知 | `flat` | 通用还原（黑/白点拉伸 + 中灰重定位 + 饱和恢复） |
+| 普通成片 / 手机照片 | `standard` | **原样通过**，不做任何处理 |
+| 达灰片特征但曲线无法确认 | `suspect` | 保守跳过，列出最可能的曲线供人工确认 |
+
+**两条硬规则**：
+
+1. **RAW 不反 log**。Sony 官方文档明确 "RAW does not apply any color space nor log curve"，
+   机内 Picture Profile 只影响成片，不影响 RAW 存储内容。
+2. **手机照片默认跳过**，但**不豁免** —— 判定依据是「是否是灰片」而不是「是不是手机」。
+   手机拍的 Log（如 iPhone 的 Apple Log）同样会被识别并还原，只是门槛从 4 分抬到 5 分
+   （误判代价不对称：把正常手机照当灰片还原会毁图，漏掉一张只是少还原一步）。
+
+```bash
+# 默认：自动判定（RAW 自动显影、灰片自动反 log、普通成片原样通过）
+"$PY" "$S" -i "D:/photos" -p portra400 -o "D:/out"
+
+# 看判定表（不做处理）：每个文件的判定、置信度、命中的特征、锁定的曲线
+"$PY" scripts/source_normalize.py "D:/photos"
+
+# 强制指定源类型（判定失误时的人工兜底）
+"$PY" "$S" -i "D:/photos" -p portra400 --source standard   # 当普通成片，跳过预处理
+"$PY" "$S" -i "D:/photos" -p portra400 --source log --log-profile s_log3
+"$PY" "$S" -i "D:/photos" -p portra400 --raw-anchor reference  # 只对齐亮度、不套参考成片色调
+"$PY" "$S" -i "D:/photos" -p portra400 --raw-anchor auto       # 无同参考成片时按分位自动锚定
+
+# 关掉判定表打印 / 导出判定结果
+"$PY" "$S" ... --no-prep-report --prep-json prep.json
+```
+
+源归一化相关参数：`--source {auto,raw,log,standard,off}`、`--log-profile`、
+`--raw-anchor {reference-tone,reference,auto,none}`（默认 `reference-tone`：对齐同参考成片的
+中位亮度并叠加其色调形状，与相机直出观感一致）、`--raw-denoise {off,light,full}`、
+`--prep-exposure`、`--prep-knee`、`--prep-knee-k`、`--no-prep-report`、`--prep-json`、`--no-raw`。
+
+> RAW 支持依赖 `rawpy`（LibRaw）。没装时 `rawpy` 缺省 → RAW 文件会被列为 `unsupported` 跳过，
+> 普通图片与灰片判定不受影响。`pip install rawpy` 即可。
 
 ## 环境
 
@@ -24,7 +71,15 @@ agent_created: true
 pip install pillow numpy
 ```
 
-脚本：`scripts/film_emulate.py`（单文件，无其它依赖）。
+想要处理 **RAW**（ARW / CR2 / NEF / DNG…）再加一个：
+
+```bash
+pip install rawpy
+```
+
+脚本：`scripts/film_emulate.py`（调色引擎）+ `scripts/source_normalize.py`（源格式判定与归一化）。
+两者都在 `scripts/` 下，`film_emulate.py` 会自动 import 同目录的 `source_normalize`；
+拷走单文件也能跑，只是失去源判定能力。
 
 > 作者本机用的是托管解释器 `C:/Users/86153/.workbuddy/binaries/python/envs/default/Scripts/python.exe`（Pillow 12 + numpy 2.5）。下面示例里的 `$PY` 按你的环境替换即可。
 
@@ -115,6 +170,25 @@ S="scripts/film_emulate.py"
 10. **单调性**：曲线 LUT 建好后 `np.maximum.accumulate` 强制单调，防止参数组合（尤其 `shadow_contrast` 与 `toe` 同时为正）导致色调反转。
 11. **PIL 默认字体没有中文字形**。要给图表加中文标签必须 `ImageFont.truetype(r"C:/Windows/Fonts/msyh.ttc", size)`，找不到再退 `simhei.ttf` / `Deng.ttf`。
 
+### 源判定专属的坑
+
+12. **`rawpy.postprocess` 已经按相机方向旋转过了**（`user_flip` 默认 −1 = 用相机值）。
+    再自己按 `sizes.flip` 转一次会转两次，竖拍 RAW 就横过来了。
+    实测 `_DSC5690.ARW`（flip=6）输出 `(6024,4024,3)` → PIL `(4024,6024)` 竖幅，
+    与相机 JPEG 摆正后的 `(4000,6000)` 一致 —— 别重复旋转。
+13. **`rawpy` 的 `sizes.width/height` 是传感器方向**：90° 类翻转（flip ∈ {5,6,7,8}）时
+    显示尺寸要交换宽高，否则判定表里打印的尺寸是错的。
+14. **基灰指纹只在「画面真的拍到纯黑」时才算硬证据**。S-Log3 / LogC3 / LogC4 的基灰**完全相同**
+    （都是 0.09286，Rec.709 视频范围黑电平设计点），画面没有纯黑时残差只能给出下界，
+    无法靠它区分同族曲线 —— 这时要靠**场景合理性**（逐个候选反 log，看解出来像不像正常曝光）裁决，
+    置信度一律降到 `low`，绝不冒充 `high`。
+15. **不要用原始 0.2% 分位当黑位**。传感器噪声会把低分位往下拉约 0.55σ，
+    足以吞掉 S-Log3 与 LogC3 之间 0.00005 的基灰差。必须用 3×3 中值/压噪后的 `pedestal`。
+16. **无彩色 / 极低对比画面**（纯黑、纯灰卡、雾天）没有可辨别的黑位，
+    不要妄想锁定曲线；`--source standard` 或 `--log-profile` 手工指定是更诚实的做法。
+17. **`--source auto` 的默认方向是保守**：判不了就跳过并打印依据，而不是猜一条曲线硬还原。
+    把正常照片当灰片反 log 会毁图，漏判只是少还一步 —— 这个不对称决定了所有阈值的取值方向。
+
 ## 验证方式（改预设后必做）
 
 ```bash
@@ -124,12 +198,25 @@ S="scripts/film_emulate.py"
 
 **只看整图缩略图判断不了颗粒、色相偏移与暗部硬度，必须 1:1 裁切复核**：全分辨率渲染 → 裁 1100×740 的区域 → 拼图。`scripts/verify/` 下的校验脚本（全部按 argv 传参，从仓库根目录跑）：
 
-- `probe.py` — 尺寸 / EXIF 方向 / 色彩信息
 - `check.py` — 光晕触发率 + `.cube` 往返正确性（identity 与红蓝互换两个夹具）
 - `check_hue.py` — 色相带调整：绿是否向青、灰是否完全不动、空带是否严格恒等
-- `chart.py` — 色调曲线 / 色彩交叉矢量 / 饱和度-亮度 / 色相带偏移 四联图
+- `chart_panels.py` — 色调曲线 / 色彩交叉矢量 / 饱和度-亮度 / 色相带偏移 四联图
 - `verify_crop.py` `verify_fuji.py` `verify_halation.py` — 1:1 裁切校样（`verify_fuji.py` 自动定位绿色最密集窗口）
 - `verify_batch.py` — 批量输出校验（数量、尺寸、EXIF 方向、平均改动量、体积变化）
+- `eval_detection.py` — 源判定验收（四组面板，见下）
+
+**改了源判定规则后必跑**（自检 + 四组验收）：
+
+```bash
+"$PY" scripts/source_normalize.py --selftest            # 40 项：官方锚点、往返、合成判定、软肩
+"$PY" scripts/source_normalize.py --selftest --crosscheck  # 再与 colour-science 独立实现对数
+"$PY" scripts/verify/eval_detection.py "<图片目录>" --raw-dir "<RAW 目录>"
+```
+
+`eval_detection.py` 四组面板：**A** 含纯黑灰片（应判 `log` 且锁进同基灰族）、
+**B** 无纯黑灰片（允许保守跳过，绝不能当普通成片）、**C** 真实相机成片（**绝不能**触发还原）、
+**D** 真实 RAW（应判 `raw` 走显影）。
+合成素材是「真实照片的线性源 + 实拍量级噪声 + 6 条曲线编码」，比纯合成场景更接近实拍。
 
 ## 富士 / 柯达的设计依据
 

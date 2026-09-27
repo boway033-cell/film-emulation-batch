@@ -6,7 +6,7 @@
 
 左：原片（SONY ILCE-6300 实拍，仅摆正方向并缩放到同宽）。右：本项目 `superia400` 预设的输出。**颗粒与光晕在缩略图上看不出来**，1:1 证据见 [`grain-and-tone-1to1.jpg`](images/grain-and-tone-1to1.jpg) 与 [`halation-grading-1to1.jpg`](images/halation-grading-1to1.jpg)。
 
-> EN: Batch film-emulation color grading in pure Pillow + NumPy. 17 presets (Fuji / Kodak / B&W), per-channel curve LUTs, selective hue-band rotation (greens → teal), channel crossover, grain, halation, vignette, acutance, external `.cube` 3D LUT support. Deterministic, offline, no API cost.
+> EN: Batch film-emulation color grading in pure Pillow + NumPy. 17 presets (Fuji / Kodak / B&W), per-channel curve LUTs, selective hue-band rotation (greens → teal), channel crossover, grain, halation, vignette, acutance, external `.cube` 3D LUT support. **Source normalization first**: RAW gets developed, log/flat footage gets de-logged, normal renders pass through — decided per file, automatically. Deterministic, offline, no API cost.
 
 ---
 
@@ -16,10 +16,56 @@
 |---|---|
 | **是** | 显示空间里的胶片风格复现：每通道曲线 LUT + 通道色偏（crossover）+ **色相带选择性调整** + 颗粒 + 高光溢出（halation）+ 暗角 + acutance |
 | **是** | 17 款预设，全部参数显式写在 `PRESETS` 里，可改、可覆盖、可复现；支持外部 `.cube` 3D LUT |
+| **是** | **源归一化前置**：自动判断输入色彩格式 —— RAW 显影成中性 sRGB、灰片/Log 反 log 还原、普通成片（含手机照片）原样通过。判定依据全部来自像素，可复核；有 6 条 log 曲线的官方系数与独立实现交叉核对 |
 | **不是** | 物理仿真。没有光谱感光曲线，颗粒也不是乳剂团簇模型（见 [已知局限](#已知局限)） |
 | **不是** | AI 重绘或生成。不改画面内容，不"补"不存在的细节，输出像素级可校对 |
 
 **为什么不用 Lightroom 预设**：因为要批量、要可复现、要能读代码里每一行的数值。`--seed 20260926` 固定后，同一张输入两次跑出的文件逐像素一致。
+
+---
+
+## 先判断色彩格式（源归一化）
+
+预设是按「已经正常显影的 sRGB 成片」标定的，所以 RAW 和灰片必须先还原，否则预设建在错误的基准上。
+**默认开启**（`--source auto`），不用额外加参数：
+
+![RAW 显影与相机直出的对照](images/raw-develop-vs-camera-jpeg.jpg)
+
+上：① 相机 JPEG 与 ② 本工具的 RAW 显影（色调已对齐 ①）；下：③ 相机 JPEG + Portra 400 与 ④ RAW 显影 + Portra 400（两者应接近 —— 预设本来就是按 ③ 这类输入标定的）。
+
+| 输入 | 处理 | 依据 |
+|---|---|---|
+| **RAW**（ARW/CR2/CR3/NEF/DNG/RAF/ORF/RW2…） | 显影为 sRGB：相机白平衡、不自动提亮、16bit 内部精度；**默认对齐同目录同名成片的中位亮度并叠加其色调形状** | Sony 官方文档：*RAW is sensor native data and RAW does not apply any color space nor log curve* —— 所以 **RAW 只显影，绝不反 log** |
+| **灰片 / Log**（S-Log3/S-Log2/V-Log/LogC3/LogC4/Apple Log） | 反 log → 线性反射率 → 中性 sRGB | 基灰指纹 + 场景合理性 + 机厂牌先验，三级判定 |
+| 普通成片 / 手机照片 | 原样通过 | 已是成品显影；手机门槛额外抬高一分 |
+
+灰片判定与还原（左：真实照片按 S-Log3 编码的模拟灰片；中：本工具判定并还原；右：原成片）：
+
+![灰片检测与还原](images/flat-log-detect-and-restore.jpg)
+
+六条曲线的官方系数、判定算法、阈值标定过程、实测混淆矩阵与已知边界，全部写在
+**[`docs/source-preparation.md`](docs/source-preparation.md)**。核心结论：
+
+* 自检 **46/46 通过**（9 项官方锚点 + 6 条曲线往返相对误差 ~1e-07 + 与 colour-science 0.4.7 交叉核对最大差 <6e-08）
+* 判定验收（`scripts/verify/eval_detection.py`，素材是「真实照片的线性源 + 实拍量级噪声 + 6 条曲线编码」，比纯合成场景更接近实拍）：
+  * 含纯黑灰片 **24/24** 类型判对、**20/24** 锁进正确曲线（其余 4 张落在同基灰族内，渲染差肉眼不可分）
+  * 无纯黑灰片 **24/24** 类型判对（门槛更高的保守分支，置信度多标 `low`）
+  * **11 张真实相机成片误报 0** —— 绝不能触发还原
+  * 真实 RAW 全部判为 `raw` 走显影分支
+* RAW 显影的默认锚定（`reference-tone`）是拿「喂进预设后像不像预设该有的样子」选的：与「相机 JPEG + 同一预设」的均差 **12.8–19.6/255**，而只对齐亮度的 `reference` 是 23.3–29.5、按分位的 `auto` 是 27.5–33.6
+* **S-Log3 / LogC3 / LogC4 的基灰完全相同**（都是 95/1023），但同一张图画面的渲染结果平均差可达 **68/255** —— 所以基灰只能定位「族」，族内必须靠机厂牌与场景先验，差异可见时置信度只标 `medium`，不假装确定
+* 画面没有纯黑时曲线属**推断**，置信度标 `low` 并明示；`--source log --log-profile <名>` 可强制
+
+```bash
+# 只判断、不写图：先把「这批文件到底是什么色彩格式」看清楚
+python scripts/source_normalize.py ./photos
+
+# 直接对 RAW 批量套预设（自动显影）
+python scripts/film_emulate.py -i ./raw -p portra400 --jobs 6 --prep-json prep.json
+
+# 报错？自检曲线实现
+python scripts/source_normalize.py --selftest --crosscheck
+```
 
 ---
 
@@ -155,9 +201,10 @@ film-emulation-batch/
 ├── README.md                          本文件
 ├── SKILL.md                           作为 WorkBuddy / Claude Code skill 使用时的说明（触发词、参数、踩坑清单）
 ├── scripts/
-│   ├── film_emulate.py                引擎与 CLI（单文件，约 1.1k 行，仅依赖 Pillow + numpy）
+│   ├── film_emulate.py                引擎与 CLI（单文件，仅依赖 Pillow + numpy）
+│   ├── source_normalize.py            源归一化：判断色彩格式 + RAW 显影 + 反 log（RAW 需 rawpy）
 │   └── verify/                        校验脚本，全部支持 argparse 风格的 argv 传参
-│       ├── probe.py                   尺寸 / EXIF 方向 / 色彩信息
+│       ├── eval_detection.py          源判定验收（四组面板：含纯黑灰片 / 无纯黑灰片 / 真实成片 / 真实 RAW）
 │       ├── check.py                   光晕阈值触发率 + `.cube` 往返正确性（identity 与红蓝互换两个夹具）
 │       ├── check_hue.py               色相带：绿是否向青、灰是否完全不动、空带是否严格恒等
 │       ├── chart_panels.py            四联图：色调曲线 / 色彩交叉矢量 / 饱和-亮度 / 色相带偏移
@@ -166,6 +213,7 @@ film-emulation-batch/
 │       ├── verify_halation.py         光晕强度分级 1:1 校样
 │       └── verify_batch.py            批量输出校验（数量 / 尺寸 / EXIF 方向 / 平均改动量 / 体积）
 ├── docs/
+│   ├── source-preparation.md          源归一化：判定算法、6 条曲线出处、阈值标定过程、已知边界
 │   ├── fuji-color-science.md          富士色彩科学：逐款性格、资料来源、现象→参数映射、已知局限
 │   └── preset-reference.md            17 款预设的完整参数表 + CLI 参数说明
 ├── images/                            本文档引用的全部图（对比图、1:1 校样、曲线对照图）
@@ -177,9 +225,9 @@ film-emulation-batch/
 
 ## 管线与校验
 
-`sRGB → 白平衡/曝光 → 每通道曲线 LUT（含暗部硬度）→ 通道色偏 crossover → 色相带调整 → 黑白混合/外部 3D LUT → acutance → 饱和度分档 → 高光溢出 → 颗粒 → 暗角 → sRGB`
+`**源归一化**（RAW 显影 / 反 log → 中性 sRGB）→ 白平衡/曝光 → 每通道曲线 LUT（含暗部硬度）→ 通道色偏 crossover → 色相带调整 → 黑白混合/外部 3D LUT → acutance → 饱和度分档 → 高光溢出 → 颗粒 → 暗角 → sRGB`
 
-改任何预设后，按这三步验收：
+改任何预设后，按这五步验收：
 
 ```bash
 S=scripts/film_emulate.py
@@ -192,6 +240,9 @@ python scripts/verify/verify_crop.py samples/sample-building.jpg ./verify_out
 python scripts/verify/verify_halation.py samples/sample-building.jpg ./verify_out
 # 4) 批量输出是否摆正、改动量是否合理
 python scripts/verify/verify_batch.py . ./out
+# 5) 源归一化：曲线实现自检 + 判定规则验收
+python scripts/source_normalize.py --selftest --crosscheck
+python scripts/verify/eval_detection.py <你的成片目录> [--raw-dir <RAW 目录>]
 ```
 
 `verify_batch.py` 会打印每张的平均 `|Δ|`。Portra 400 跑这批建筑照是 4.5–6.4 / 255，Superia 400 是 6.6–9.3 / 255 —— **超过 10 就要怀疑是不是过调了**。
@@ -200,12 +251,24 @@ python scripts/verify/verify_batch.py . ./out
 
 ## 已知局限
 
+**调色侧**
+
 1. **不是物理仿真**。真实底片的青层/品红层响应是波长函数，这里只是显示空间的色彩交叉。做"风格复现"够用，做"某卷胶片在某光源下的精确还原"不够。
 2. **色相带是宽环带**，分不清"花黄"与"土黄"，也不能对同一色带内的不同材质分别处理。
 3. **颗粒是高斯噪声按亮度调制**，不是乳剂团簇结构 —— 放大到 200% 看，缺少那种"结块"的不规则感。`size` 只能调粗细。
 4. **反转片的局部饱和度突变**（Velvia 对红/绿/蓝的强推）用宽环带近似，边缘会有轻微溢色。
 5. **没做扫描仪的贡献**。真实"富士感"有很大一部分来自扫描与校色环节，这里直接从 sRGB 数码原片出发。
 6. 带颗粒的输出体积比原片大 20–40%（颗粒是高频信号，且用 4:4:4 + 质量 96）。嫌大就 `--quality 92`。
+
+**源归一化侧**（详见 [`docs/source-preparation.md`](docs/source-preparation.md) §5）
+
+7. **单张 8bit 图无法在数学上区分「log 编码的暗场景」与「正常显影但扁平的照片」**。这是问题本质，不是实现缺陷 —— 所以判定只承诺「扁平与否」的二值判断，以及**有硬证据时才锁定具体曲线**。
+8. **画面没有纯黑时曲线属推断** —— 中灰先验在雾天 / 夜景 / 高调棚拍会失准，置信度标 `low`，可用 `--source log` 强制。
+9. **同基灰族内曲线会互换**（S-Log3 / LogC3 / LogC4 基灰完全相同）。基灰确认时靠残差排序，未确认时只能靠场景中灰先验；凡涉及族内推断，置信度一律 `medium` 或 `low`，渲染差异肉眼可见时会显式提示备选曲线与渲染均差。
+10. **Log 且高光已触顶的画面会被保守跳过** —— 宁可少还原一步，也不把正常照片改坏。11 张真实相机成片的误报为 0，代价就是这种保守。
+11. **Canon Log 未收录**：两处公开实现（v1 / v1.2）都不能同时复现 Canon 官方表格五点数值，宁可不做也不放错曲线进来。
+12. **HEIC / HEIF 不支持**（需 `pillow-heif`），会被标为 `unsupported` 并提示，不会静默跳过。
+13. **不做色彩空间转换**：只处理编码曲线，不做 S-Gamut / V-Gamut / BT.2020 → sRGB 的矩阵转换。
 
 ---
 
